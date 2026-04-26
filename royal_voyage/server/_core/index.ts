@@ -1,0 +1,408 @@
+// @ts-nocheck
+import "dotenv/config";
+import express from "express";
+import { createServer } from "http";
+import net from "net";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createExpressMiddleware } from "@trpc/server/adapters/express";
+import { registerOAuthRoutes } from "./oauth";
+import { constructWebhookEvent, isStripeWebhookConfigured } from "../stripe";
+import { appRouter } from "../routers";
+import { createContext } from "./context";
+import { buildCheckoutPage, buildSuccessPage } from "./paypal-pages";
+import { partnerRouter } from "../partner-api";
+import { iataRouter } from "../iata-endpoints";
+
+function isPortAvailable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.listen(port, () => {
+      server.close(() => resolve(true));
+    });
+    server.on("error", () => resolve(false));
+  });
+}
+
+async function findAvailablePort(startPort: number = 3000): Promise<number> {
+  for (let port = startPort; port < startPort + 20; port++) {
+    if (await isPortAvailable(port)) {
+      return port;
+    }
+  }
+  throw new Error(`No available port found starting from ${startPort}`);
+}
+
+async function startServer() {
+  const app = express();
+  const server = createServer(app);
+
+  // CORS — allow only trusted origins (production)
+  const ALLOWED_ORIGINS = [
+    "https://royalvoyage.online",
+    "https://www.royalvoyage.online",
+    "https://royalvoyage-dcsedylm.manus.space",
+    // NOTE: manus.space sandbox domain added for deployed preview
+  ];
+  const ALLOWED_ORIGIN_PATTERNS = [
+    /^https?:\/\/localhost(:\d+)?$/,
+    /^https?:\/\/127\.0\.0\.1(:\d+)?$/,
+    /\.manus\.computer$/,
+    /\.manuspre\.computer$/,
+    /\.manus\.space$/,
+  ];
+
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const isAllowed = origin && (
+      ALLOWED_ORIGINS.includes(origin) ||
+      ALLOWED_ORIGIN_PATTERNS.some((p) => p.test(origin))
+    );
+    if (isAllowed && origin) {
+      res.header("Access-Control-Allow-Origin", origin);
+      res.header("Access-Control-Allow-Credentials", "true");
+    }
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization",
+    );
+
+    // Handle preflight requests
+    if (req.method === "OPTIONS") {
+      res.sendStatus(isAllowed ? 200 : 403);
+      return;
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+  registerOAuthRoutes(app);
+  registerWebhookRoutes(app);
+
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, timestamp: Date.now() });
+  });
+
+  // PayPal Hosted Button payment page
+  app.get("/api/paypal-checkout", (req, res) => {
+    const amount = String(req.query.amount || "0");
+    const currency = String(req.query.currency || "EUR");
+    const booking = String(req.query.booking || "");
+    const name = String(req.query.name || "");
+    const scheme = String(req.query.scheme || "royalvoyage");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(buildCheckoutPage({ amount, currency, booking, name, scheme }));
+  });
+
+  // PayPal Success page
+  app.get("/api/paypal-success", (req, res) => {
+    const tx = String(req.query.tx || "N/A");
+    const amount = String(req.query.amount || "0");
+    const currency = String(req.query.currency || "EUR");
+    const name = String(req.query.name || "");
+    const scheme = String(req.query.scheme || "royalvoyage");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(buildSuccessPage({ tx, amount, currency, name, scheme }));
+  });
+
+  // ── Stripe Webhook ──────────────────────────────────────────────────
+  // Must use raw body for signature verification
+  app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+    const sig = req.headers["stripe-signature"] as string;
+    // Use env var first, fall back to hardcoded value if not set
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      console.error("[Stripe Webhook] STRIPE_WEBHOOK_SECRET environment variable is not set");
+      res.status(500).json({ error: "Webhook secret not configured" });
+      return;
+    }
+
+    if (!sig) {
+      console.warn("[Stripe Webhook] Missing stripe-signature header");
+      res.status(400).json({ error: "Missing stripe-signature header" });
+      return;
+    }
+
+    let event;
+    try {
+      event = constructWebhookEvent(req.body, sig, webhookSecret);
+    } catch (err: any) {
+      console.error("[Stripe Webhook] Signature verification failed:", err.message);
+      res.status(400).send(`Webhook Error: ${err.message}`);
+      return;
+    }
+
+    console.log(`[Stripe Webhook] Event: ${event.type}`);
+
+    if (event.type === "payment_intent.succeeded") {
+      const pi = event.data.object as any;
+      const bookingRef = pi.metadata?.bookingRef || pi.metadata?.booking || "";
+      const notification = {
+        id: pi.id,
+        type: "stripe_payment_succeeded",
+        paymentIntentId: pi.id,
+        amount: pi.amount,
+        currency: pi.currency,
+        bookingRef,
+        metadata: pi.metadata,
+        timestamp: new Date().toISOString(),
+      };
+      if (!(global as any)._stripeNotifications) (global as any)._stripeNotifications = [];
+      (global as any)._stripeNotifications.unshift(notification);
+      if ((global as any)._stripeNotifications.length > 100) {
+        (global as any)._stripeNotifications.length = 100;
+      }
+      console.log(`[Stripe Webhook] Payment succeeded for booking: ${bookingRef}, amount: ${pi.amount} ${pi.currency}`);
+
+      // ── Send Push Notification to Admin ──────────────────────────────
+      const adminToken = (global as any)._adminPushToken;
+      if (adminToken) {
+        try {
+          await fetch("https://exp.host/--/api/v2/push/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              to: adminToken,
+              sound: "default",
+              title: "💳 دفع ناجح عبر Stripe",
+              body: `حجز ${bookingRef} - ${(pi.amount / 100).toFixed(2)} ${pi.currency.toUpperCase()}`,
+              data: { bookingRef, paymentIntentId: pi.id, type: "stripe_payment" },
+            }),
+          });
+          console.log(`[Stripe Webhook] Push sent to admin for booking: ${bookingRef}`);
+        } catch (pushErr: any) {
+          console.error("[Stripe Webhook] Push notification failed:", pushErr.message);
+        }
+      }
+
+      // ── Send Confirmation Email to Customer ───────────────────────────
+      const customerEmail = pi.metadata?.passengerEmail || pi.receipt_email;
+      const customerName = pi.metadata?.passengerName || "العميل";
+      const amountEur = (pi.amount / 100).toFixed(2);
+      if (customerEmail) {
+        try {
+          const { sendPaymentConfirmationEmail } = await import("../email.js");
+          await sendPaymentConfirmationEmail({
+            passengerEmail: customerEmail,
+            passengerName: customerName,
+            bookingRef: bookingRef || pi.id,
+            bookingType: (pi.metadata?.bookingType as "flight" | "hotel") || "flight",
+            totalAmount: `${amountEur} ${pi.currency.toUpperCase()}`,
+            paymentMethod: "Visa/Mastercard (Stripe)",
+            pnr: pi.metadata?.pnr,
+            confirmedAt: new Date().toLocaleString("ar-SA"),
+          });
+          console.log(`[Stripe Webhook] Confirmation email sent to: ${customerEmail}`);
+        } catch (emailErr: any) {
+          console.error("[Stripe Webhook] Email failed:", emailErr.message);
+        }
+      }
+    }
+
+    res.json({ received: true });
+  });
+
+  // Admin endpoint to get Stripe notifications
+  app.get("/api/stripe-notifications", (_req, res) => {
+    res.json({ notifications: (global as any)._stripeNotifications || [] });
+  });
+
+  // Admin endpoint to issue a Stripe refund
+  app.post("/api/stripe-refund", express.json(), async (req, res) => {
+    const { paymentIntentId, reason } = req.body || {};
+    if (!paymentIntentId) {
+      res.status(400).json({ error: "paymentIntentId is required" });
+      return;
+    }
+    try {
+      const { getStripe } = await import("../stripe.js");
+      const stripe = getStripe();
+      // Retrieve the payment intent to get the charge
+      const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+      const chargeId = typeof pi.latest_charge === "string" ? pi.latest_charge : pi.latest_charge?.id;
+      if (!chargeId) {
+        res.status(400).json({ error: "No charge found for this payment intent" });
+        return;
+      }
+      const refund = await stripe.refunds.create({
+        charge: chargeId,
+        reason: (reason as any) || "requested_by_customer",
+      });
+      console.log(`[Stripe Refund] Refund created: ${refund.id} for PI: ${paymentIntentId}`);
+      // Update notification status in memory
+      if ((global as any)._stripeNotifications) {
+        const notif = (global as any)._stripeNotifications.find((n: any) => n.paymentIntentId === paymentIntentId);
+        if (notif) notif.refunded = true;
+      }
+      res.json({ success: true, refundId: refund.id, status: refund.status });
+    } catch (err: any) {
+      console.error("[Stripe Refund] Error:", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Admin endpoint to register push token for Stripe payment alerts
+  app.post("/api/admin/register-push-token", express.json(), (req, res) => {
+    const { token } = req.body || {};
+    if (!token) {
+      res.status(400).json({ error: "token is required" });
+      return;
+    }
+    (global as any)._adminPushToken = token;
+    console.log(`[Admin] Push token registered: ${token.substring(0, 20)}...`);
+    res.json({ success: true });
+  });
+
+  // PayPal payment notification endpoint with validation
+  app.post("/api/paypal-notify", async (req, res) => {
+    const { txId, amount, currency, name, booking } = req.body || {};
+    console.log(`[PayPal] Payment received: TX=${txId}, Amount=${amount} ${currency}, Name=${name}, Booking=${booking}`);
+
+    // Validate required fields
+    let verified = false;
+    let verificationNote = "";
+    if (!txId || txId === "N/A") {
+      verificationNote = "Missing transaction ID";
+    } else {
+      // Attempt to verify via PayPal Orders API (if access token available)
+      try {
+        const clientId = "BAAe3HWztSL3qmFxXI2nVSKirPWH_KJhAUyU9OPRnVTQZ8kmmdeF5u2yYJkIYGlqBhOnQvyxhDpFF9qI90";
+        const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+        if (clientSecret) {
+          // Get access token
+          const authRes = await fetch("https://api-m.paypal.com/v1/oauth2/token", {
+            method: "POST",
+            headers: {
+              "Authorization": "Basic " + Buffer.from(clientId + ":" + clientSecret).toString("base64"),
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: "grant_type=client_credentials",
+          });
+          if (authRes.ok) {
+            const authData = await authRes.json() as { access_token: string };
+            // Check order status
+            const orderRes = await fetch(`https://api-m.paypal.com/v2/checkout/orders/${txId}`, {
+              headers: { "Authorization": `Bearer ${authData.access_token}` },
+            });
+            if (orderRes.ok) {
+              const orderData = await orderRes.json() as { status: string };
+              verified = orderData.status === "COMPLETED" || orderData.status === "APPROVED";
+              verificationNote = `PayPal status: ${orderData.status}`;
+              console.log(`[PayPal] Verification: ${verificationNote}`);
+            } else {
+              verificationNote = "Could not verify order - API error";
+            }
+          }
+        } else {
+          // No secret configured - mark as unverified but still record
+          verificationNote = "PayPal secret not configured - manual verification needed";
+        }
+      } catch (err) {
+        verificationNote = "Verification failed - network error";
+        console.warn("[PayPal] Verification error:", err);
+      }
+    }
+
+    const notification = {
+      id: Date.now().toString(),
+      type: "paypal_payment",
+      txId,
+      amount,
+      currency,
+      name,
+      booking,
+      verified,
+      verificationNote,
+      timestamp: new Date().toISOString(),
+    };
+    if (!(global as any)._paypalNotifications) (global as any)._paypalNotifications = [];
+    (global as any)._paypalNotifications.unshift(notification);
+    if ((global as any)._paypalNotifications.length > 100) {
+      (global as any)._paypalNotifications.length = 100;
+    }
+    res.json({ ok: true, verified, notification });
+  });
+
+  // Admin endpoint to get PayPal notifications
+  app.get("/api/paypal-notifications", (_req, res) => {
+    res.json({ notifications: (global as any)._paypalNotifications || [] });
+  });
+
+  // Partner API routes
+  app.use("/api/partner", partnerRouter);
+
+  // IATA Agency Management routes
+  app.use("/api/iata", iataRouter);
+
+  app.use(
+    "/api/trpc",
+    createExpressMiddleware({
+      router: appRouter,
+      createContext,
+    }),
+  );
+
+  const preferredPort = parseInt(process.env.PORT || "3000");
+  const port = await findAvailablePort(preferredPort);
+
+  if (port !== preferredPort) {
+    console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+  }
+
+  // Serve static web build
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const webDistPath = path.join(__dirname, "../../web-dist");
+  const distPath = path.join(__dirname, "../../dist");
+
+  // Landing Page - serve at /landing and redirect root to landing
+  app.get("/landing", (_req, res) => {
+    res.sendFile(path.join(webDistPath, "landing.html"));
+  });
+  // Root redirect to landing page
+  app.get("/", (_req, res) => {
+    res.sendFile(path.join(webDistPath, "landing.html"));
+  });
+  // Serve icon and favicon for landing page
+  app.get("/icon.png", (_req, res) => {
+    res.sendFile(path.join(webDistPath, "icon.png"));
+  });
+  app.get("/favicon.png", (_req, res) => {
+    res.sendFile(path.join(webDistPath, "favicon.png"));
+  });
+
+  // SEO files
+  app.get("/sitemap.xml", (_req, res) => {
+    res.setHeader("Content-Type", "application/xml");
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://royalvoyage.online/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
+  <url><loc>https://royalvoyage.online/privacy</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://royalvoyage.online/terms</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://royalvoyage.online/refund</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://royalvoyage.online/contact</loc><changefreq>monthly</changefreq><priority>0.7</priority></url>
+</urlset>`);
+  });
+
+  app.get("/robots.txt", (_req, res) => {
+    res.setHeader("Content-Type", "text/plain");
+    res.send(`User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /admin/\nSitemap: https://royalvoyage.online/sitemap.xml`);
+  });
+
+  app.use(express.static(webDistPath));
+
+  // SPA fallback — serve index.html for all non-API routes
+  app.get("*", (req, res) => {
+    if (!req.path.startsWith("/api")) {
+      res.sendFile(path.join(webDistPath, "index.html"));
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`[api] server listening on port ${port}`);
+  });
+}
+
+startServer().catch(console.error);

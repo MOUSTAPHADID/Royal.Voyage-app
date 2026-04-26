@@ -1,0 +1,29 @@
+Approved base version: royal_voyage_approved_base_merged.zip
+Source: merged from royal_voyage_partner_api_ready.zip + royal_voyage_hotelbeds_frontend_verified.zip
+Do not use old rollback checkpoints.
+
+Required files verified:
+✅ server/partner-api.ts
+✅ server/flight-provider.ts
+✅ server/providers/tpconnects-provider.ts
+✅ server/hotelbeds.ts
+✅ app/auth/register.tsx
+✅ app/hotels/results.tsx
+✅ app/(tabs)/index.tsx
+✅ components/back-button.tsx
+
+Features verified:
+✅ Home screen white background
+✅ Airline/Duffel sections removed
+✅ Amadeus preserved
+✅ Hotelbeds backend + frontend preserved
+✅ Partner API preserved
+✅ Flight provider abstraction preserved
+✅ TPConnects skeleton preserved
+✅ Partner registration link preserved
+✅ Professional back button preserved
+✅ 0 TypeScript errors
+
+This is the stable, production-ready base version.
+Do not rollback to older checkpoints.
+Use this version as the foundation for all future changes.

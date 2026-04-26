@@ -1,0 +1,300 @@
+import React, { useState, useMemo } from "react";
+import {
+  View,
+  Text,
+  FlatList,
+  Pressable,
+  ActivityIndicator,
+  Image,
+  StyleSheet,
+  ScrollView,
+  TouchableOpacity,
+} from "react-native";
+import { router, useLocalSearchParams } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { IconSymbol } from "@/components/ui/icon-symbol";
+import { useColors } from "@/hooks/use-colors";
+import { trpc } from "@/lib/trpc";
+import { useTranslation } from "@/lib/i18n";
+import { useFavoriteActivities } from "@/hooks/use-favorite-activities";
+
+type CategoryFilter = "all" | "tours" | "adventure" | "culture" | "nature" | "food";
+type PriceFilter = "all" | "low" | "medium" | "high";
+type RatingFilter = "all" | "4plus" | "3plus";
+
+export default function ActivitiesScreen() {
+  const colors = useColors();
+  const { t, isRTL } = useTranslation();
+  const params = useLocalSearchParams<{ destinationCode?: string; destName?: string; fromDate?: string; toDate?: string; language?: string; children?: string }>();
+
+  const destinationCode = params.destinationCode || "BCN";
+  const destName = params.destName || destinationCode;
+  const fromDate = params.fromDate || new Date().toISOString().split("T")[0];
+  const toDate = params.toDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const language = params.language || "en";
+
+  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>("all");
+  const [priceFilter, setPriceFilter] = useState<PriceFilter>("all");
+  const [ratingFilter, setRatingFilter] = useState<RatingFilter>("all");
+  const { isFavorite, toggleFavorite, favorites } = useFavoriteActivities();
+
+  const { data: activities = [], isLoading } = trpc.hbxActivities.search.useQuery(
+    { destinationCode, fromDate, toDate, language },
+    { enabled: !!destinationCode }
+  );
+
+  // Filter logic
+  const filteredActivities = useMemo(() => {
+    let result = activities;
+
+    // Category filter
+    if (categoryFilter !== "all") {
+      result = result.filter((act: any) => {
+        const cat = act.category?.toLowerCase() || "";
+        if (categoryFilter === "tours") return cat.includes("tour") || cat.includes("جولة");
+        if (categoryFilter === "adventure") return cat.includes("adventure") || cat.includes("مغامرة");
+        if (categoryFilter === "culture") return cat.includes("culture") || cat.includes("ثقافة") || cat.includes("museum");
+        if (categoryFilter === "nature") return cat.includes("nature") || cat.includes("طبيعة") || cat.includes("park");
+        if (categoryFilter === "food") return cat.includes("food") || cat.includes("طعام") || cat.includes("culinary");
+        return true;
+      });
+    }
+
+    // Price filter
+    if (priceFilter !== "all") {
+      result = result.filter((act: any) => {
+        const price = act.minPrice;
+        if (priceFilter === "low") return price > 0 && price <= 50;
+        if (priceFilter === "medium") return price > 50 && price <= 150;
+        if (priceFilter === "high") return price > 150;
+        return true;
+      });
+    }
+
+    // Rating filter (using minPrice as proxy since HBX doesn't return ratings directly)
+    // Activities with higher prices tend to have better quality; we use a simple heuristic
+    if (ratingFilter !== "all") {
+      result = result.filter((act: any) => {
+        // Simulate rating: price > 30 = 4+, price > 10 = 3+
+        if (ratingFilter === "4plus") return act.minPrice > 30;
+        if (ratingFilter === "3plus") return act.minPrice > 10;
+        return true;
+      });
+    }
+
+    return result;
+  }, [activities, categoryFilter, priceFilter, ratingFilter]);
+
+  const renderActivity = ({ item }: { item: typeof activities[0] }) => (
+    <Pressable
+      style={({ pressed }) => [styles.card, { backgroundColor: colors.surface, opacity: pressed ? 0.85 : 1 }]}
+      onPress={() => router.push({ pathname: "/activities/[id]", params: { id: item.code, name: item.name } } as any)}
+    >
+      <View style={{ position: "relative" }}>
+        <Image source={{ uri: item.image }} style={styles.cardImage} resizeMode="cover" />
+        <TouchableOpacity
+          style={[styles.favBtn, { backgroundColor: "rgba(0,0,0,0.4)" }]}
+          onPress={(e) => { e.stopPropagation?.(); toggleFavorite({ code: item.code, name: item.name, image: item.image, minPrice: item.minPrice, currency: item.currency, category: item.category, duration: item.duration, destinationCode, destName }); }}
+        >
+          <Text style={{ fontSize: 18 }}>{isFavorite(item.code) ? "❤️" : "🤍"}</Text>
+        </TouchableOpacity>
+      </View>
+      <View style={styles.cardContent}>
+        {item.category ? (
+          <View style={[styles.badge, { backgroundColor: "#10B981" + "20" }]}>
+            <Text style={[styles.badgeText, { color: "#10B981" }]}>{item.category}</Text>
+          </View>
+        ) : null}
+        <Text style={[styles.cardTitle, { color: colors.foreground }]} numberOfLines={2}>{item.name}</Text>
+        <View style={styles.cardRow}>
+          <IconSymbol name="location.fill" size={13} color={colors.muted} />
+          <Text style={[styles.cardMeta, { color: colors.muted }]}>{item.city}</Text>
+        </View>
+        {item.duration ? (
+          <View style={styles.cardRow}>
+            <IconSymbol name="clock.fill" size={13} color={colors.muted} />
+            <Text style={[styles.cardMeta, { color: colors.muted }]}>{item.duration}</Text>
+          </View>
+        ) : null}
+        <View style={styles.cardFooter}>
+          <Text style={[styles.priceLabel, { color: colors.muted }]}>{isRTL ? "من " : "From "}</Text>
+          <Text style={[styles.price, { color: "#10B981" }]}>
+            {item.minPrice > 0 ? `${item.minPrice} ${item.currency}` : (isRTL ? "اتصل للسعر" : "Contact for price")}
+          </Text>
+        </View>
+      </View>
+    </Pressable>
+  );
+
+  const categoryOptions: { key: CategoryFilter; label: string; icon: string }[] = [
+    { key: "all", label: isRTL ? "الكل" : "All", icon: "🌍" },
+    { key: "tours", label: isRTL ? "جولات" : "Tours", icon: "🚌" },
+    { key: "adventure", label: isRTL ? "مغامرة" : "Adventure", icon: "🏔️" },
+    { key: "culture", label: isRTL ? "ثقافة" : "Culture", icon: "🏛️" },
+    { key: "nature", label: isRTL ? "طبيعة" : "Nature", icon: "🌳" },
+    { key: "food", label: isRTL ? "طعام" : "Food", icon: "🍽️" },
+  ];
+
+  const priceOptions: { key: PriceFilter; label: string }[] = [
+    { key: "all", label: isRTL ? "الكل" : "All" },
+    { key: "low", label: isRTL ? "< 50" : "< 50" },
+    { key: "medium", label: isRTL ? "50-150" : "50-150" },
+    { key: "high", label: isRTL ? "> 150" : "> 150" },
+  ];
+
+  const ratingOptions: { key: RatingFilter; label: string }[] = [
+    { key: "all", label: isRTL ? "كل التقييمات" : "All Ratings" },
+    { key: "4plus", label: isRTL ? "⭐ 4+ نجوم" : "⭐ 4+ Stars" },
+    { key: "3plus", label: isRTL ? "⭐ 3+ نجوم" : "⭐ 3+ Stars" },
+  ];
+
+  return (
+    <ScreenContainer>
+      <View style={[styles.header, { backgroundColor: colors.background, borderBottomColor: colors.border }]}>
+        <Pressable style={({ pressed }) => [styles.backBtn, { opacity: pressed ? 0.6 : 1 }]} onPress={() => router.back()}>
+          <IconSymbol name="arrow.left" size={22} color={colors.foreground} />
+        </Pressable>
+        <View style={{ flex: 1, alignItems: "center" }}>
+          <Text style={[styles.headerTitle, { color: colors.foreground }]}>{isRTL ? "الأنشطة السياحية" : "Activities"}</Text>
+          <Text style={[styles.headerSubtitle, { color: colors.muted }]}>{destName}</Text>
+        </View>
+        <Pressable
+          style={({ pressed }) => [styles.backBtn, { opacity: pressed ? 0.6 : 1 }]}
+          onPress={() => router.push("/activities/favorites" as any)}
+        >
+          <Text style={{ fontSize: 22 }}>{favorites.length > 0 ? "❤️" : "🤍"}</Text>
+        </Pressable>
+      </View>
+
+      {/* Filters */}
+      <View style={[styles.filtersSection, { backgroundColor: colors.background, borderBottomColor: colors.border }]}>
+        {/* Category filter */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+          {categoryOptions.map((opt) => (
+            <Pressable
+              key={opt.key}
+              style={({ pressed }) => [
+                styles.filterChip,
+                {
+                  backgroundColor: categoryFilter === opt.key ? "#10B981" : colors.surface,
+                  borderColor: categoryFilter === opt.key ? "#10B981" : colors.border,
+                  opacity: pressed ? 0.7 : 1,
+                },
+              ]}
+              onPress={() => setCategoryFilter(opt.key)}
+            >
+              <Text style={styles.filterIcon}>{opt.icon}</Text>
+              <Text style={[styles.filterLabel, { color: categoryFilter === opt.key ? "#fff" : colors.foreground }]}>
+                {opt.label}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+
+        {/* Price filter */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+          {priceOptions.map((opt) => (
+            <Pressable
+              key={opt.key}
+              style={({ pressed }) => [
+                styles.filterChip,
+                {
+                  backgroundColor: priceFilter === opt.key ? "#10B981" : colors.surface,
+                  borderColor: priceFilter === opt.key ? "#10B981" : colors.border,
+                  opacity: pressed ? 0.7 : 1,
+                },
+              ]}
+              onPress={() => setPriceFilter(opt.key)}
+            >
+              <Text style={[styles.filterLabel, { color: priceFilter === opt.key ? "#fff" : colors.foreground }]}>
+                {opt.label}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+
+        {/* Rating filter */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+          {ratingOptions.map((opt) => (
+            <Pressable
+              key={opt.key}
+              style={({ pressed }) => [
+                styles.filterChip,
+                {
+                  backgroundColor: ratingFilter === opt.key ? "#F59E0B" : colors.surface,
+                  borderColor: ratingFilter === opt.key ? "#F59E0B" : colors.border,
+                  opacity: pressed ? 0.7 : 1,
+                },
+              ]}
+              onPress={() => setRatingFilter(opt.key)}
+            >
+              <Text style={[styles.filterLabel, { color: ratingFilter === opt.key ? "#fff" : colors.foreground }]}>
+                {opt.label}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      </View>
+
+      {isLoading ? (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color="#10B981" />
+          <Text style={[styles.loadingText, { color: colors.muted }]}>{isRTL ? "جاري البحث..." : "Searching..."}</Text>
+        </View>
+      ) : filteredActivities.length === 0 ? (
+        <View style={styles.center}>
+          <IconSymbol name="binoculars.fill" size={48} color={colors.muted} />
+          <Text style={[styles.emptyTitle, { color: colors.foreground }]}>
+            {isRTL ? "لا توجد أنشطة" : "No activities found"}
+          </Text>
+          <Text style={[styles.emptyText, { color: colors.muted }]}>
+            {isRTL ? "جرّب تغيير الفلاتر أو الوجهة" : "Try changing filters or destination"}
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          data={filteredActivities}
+          keyExtractor={(item) => item.code}
+          renderItem={renderActivity}
+          contentContainerStyle={styles.list}
+          showsVerticalScrollIndicator={false}
+          ListHeaderComponent={
+            <Text style={[styles.resultsCount, { color: colors.muted }]}>
+              {filteredActivities.length} {isRTL ? "نشاط في" : "activities in"} {destName}
+            </Text>
+          }
+        />
+      )}
+    </ScreenContainer>
+  );
+}
+
+const styles = StyleSheet.create({
+  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 0.5 },
+  backBtn: { width: 40, height: 40, justifyContent: "center" },
+  headerTitle: { fontSize: 17, fontWeight: "700" },
+  headerSubtitle: { fontSize: 12, marginTop: 2 },
+  filtersSection: { paddingVertical: 12, borderBottomWidth: 0.5 },
+  filterRow: { paddingHorizontal: 16, gap: 8, paddingBottom: 8 },
+  filterChip: { flexDirection: "row", alignItems: "center", paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20, borderWidth: 1, gap: 4 },
+  filterIcon: { fontSize: 14 },
+  filterLabel: { fontSize: 13, fontWeight: "600" },
+  center: { flex: 1, justifyContent: "center", alignItems: "center", gap: 12, padding: 24 },
+  loadingText: { fontSize: 14, marginTop: 8 },
+  emptyTitle: { fontSize: 18, fontWeight: "700", marginTop: 12 },
+  emptyText: { fontSize: 14, textAlign: "center", lineHeight: 20 },
+  list: { paddingHorizontal: 16, paddingBottom: 32, paddingTop: 12 },
+  resultsCount: { fontSize: 13, marginBottom: 12, textAlign: "right" },
+  card: { borderRadius: 16, marginBottom: 16, overflow: "hidden", shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.08, shadowRadius: 8, elevation: 3 },
+  cardImage: { width: "100%", height: 180 },
+  cardContent: { padding: 14, gap: 6 },
+  badge: { alignSelf: "flex-start", paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  badgeText: { fontSize: 11, fontWeight: "600" },
+  cardTitle: { fontSize: 15, fontWeight: "700", lineHeight: 22 },
+  cardRow: { flexDirection: "row", alignItems: "center", gap: 4 },
+  cardMeta: { fontSize: 12 },
+  cardFooter: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 4 },
+  priceLabel: { fontSize: 12 },
+  price: { fontSize: 16, fontWeight: "700" },
+  favBtn: { position: "absolute", top: 8, right: 8, width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
+});

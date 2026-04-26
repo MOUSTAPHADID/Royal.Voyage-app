@@ -1,0 +1,2264 @@
+import React, { useState, useRef, useEffect } from "react";
+import {
+  View,
+  Text,
+  ScrollView,
+  Pressable,
+  StyleSheet,
+  Image,
+  FlatList,
+  Modal,
+  Animated,
+  Platform,
+  Alert,
+  TextInput,
+} from "react-native";
+import { useRouter } from "expo-router";
+import { ScreenContainer } from "@/components/screen-container";
+import { useColors } from "@/hooks/use-colors";
+import { useApp } from "@/lib/app-context";
+import { DESTINATIONS } from "@/lib/mock-data";
+import { IconSymbol } from "@/components/ui/icon-symbol";
+import { LocationAutocomplete } from "@/components/location-autocomplete";
+import { DatePickerField } from "@/components/ui/date-picker-field";
+import { useTranslation } from "@/lib/i18n";
+import { trpc } from "@/lib/trpc";
+import {
+  useAudioRecorder,
+  useAudioRecorderState,
+  requestRecordingPermissionsAsync,
+  setAudioModeAsync,
+  RecordingPresets,
+} from "expo-audio";
+import * as FileSystem from "expo-file-system/legacy";
+import FontAwesome5 from "@expo/vector-icons/FontAwesome5";
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
+import { Linking } from "react-native";
+
+type SearchTab = "flights" | "hotels" | "activities";
+type TripType = "oneway" | "roundtrip" | "multicity";
+type CabinClass = "ECONOMY" | "PREMIUM_ECONOMY" | "BUSINESS" | "FIRST";
+
+// Helper: get next date N days from now in YYYY-MM-DD
+function futureDate(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function formatDate(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function formatDateShort(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+// ── Voice Search Modal ────────────────────────────────────────────────────────
+function VoiceSearchModal({
+  visible,
+  onClose,
+  onResult,
+  isRTL,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onResult: (text: string) => void;
+  isRTL: boolean;
+}) {
+  const colors = useColors();
+  const audioRecorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
+  const recorderState = useAudioRecorderState(audioRecorder);
+  const [status, setStatus] = useState<"idle" | "recording" | "processing" | "done" | "error">("idle");
+  const [resultText, setResultText] = useState("");
+  const [manualText, setManualText] = useState("");
+
+  // Animated wave bars
+  const bars = [useRef(new Animated.Value(0.3)).current, useRef(new Animated.Value(0.3)).current, useRef(new Animated.Value(0.3)).current, useRef(new Animated.Value(0.3)).current, useRef(new Animated.Value(0.3)).current];
+
+  const transcribeMutation = trpc.voice.transcribe.useMutation({
+    onSuccess: (data) => {
+      if (data.success && data.text) {
+        setResultText(data.text);
+        setStatus("done");
+        setTimeout(() => {
+          onResult(data.text);
+          onClose();
+        }, 1200);
+      } else {
+        setStatus("error");
+      }
+    },
+    onError: () => setStatus("error"),
+  });
+
+  // Animate wave bars when recording
+  useEffect(() => {
+    if (status === "recording") {
+      const animations = bars.map((bar, i) =>
+        Animated.loop(
+          Animated.sequence([
+            Animated.timing(bar, { toValue: 0.9, duration: 300 + i * 80, useNativeDriver: true }),
+            Animated.timing(bar, { toValue: 0.3, duration: 300 + i * 80, useNativeDriver: true }),
+          ])
+        )
+      );
+      animations.forEach((a) => a.start());
+      return () => animations.forEach((a) => a.stop());
+    } else {
+      bars.forEach((bar) => bar.setValue(0.3));
+    }
+  }, [status]);
+
+  // Reset when modal opens
+  useEffect(() => {
+    if (visible) {
+      setStatus("idle");
+      setResultText("");
+      setManualText("");
+    }
+  }, [visible]);
+
+  const startRecording = async () => {
+    try {
+      const perm = await requestRecordingPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(
+          isRTL ? "إذن الميكروفون" : "Microphone Permission",
+          isRTL ? "يرجى السماح بالوصول إلى الميكروفون" : "Please allow microphone access"
+        );
+        return;
+      }
+      await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
+      await audioRecorder.prepareToRecordAsync();
+      audioRecorder.record();
+      setStatus("recording");
+    } catch (e) {
+      setStatus("error");
+    }
+  };
+
+  const stopRecording = async () => {
+    try {
+      setStatus("processing");
+      await audioRecorder.stop();
+      const uri = audioRecorder.uri;
+      if (!uri) { setStatus("error"); return; }
+
+      // Read file as base64
+      const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+      const mimeType = Platform.OS === "ios" ? "audio/m4a" : "audio/m4a";
+
+      transcribeMutation.mutate({ audioBase64: base64, mimeType, language: isRTL ? "ar" : undefined });
+    } catch (e) {
+      setStatus("error");
+    }
+  };
+
+  const handleMicPress = () => {
+    if (status === "idle") startRecording();
+    else if (status === "recording") stopRecording();
+  };
+
+  const submitManualText = () => {
+    const value = manualText.trim();
+    if (!value) {
+      Alert.alert(isRTL ? "اكتب الوجهة" : "Enter destination", isRTL ? "يرجى كتابة المدينة أو المطار." : "Please type a city or airport.");
+      return;
+    }
+    onResult(value);
+    onClose();
+  };
+
+  const micColor = status === "recording" ? "#EF4444" : status === "processing" ? colors.muted : colors.primary;
+  const micBg = status === "recording" ? "#FEE2E2" : status === "processing" ? colors.border : colors.primary + "18";
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={voiceStyles.overlay}>
+        <Pressable style={voiceStyles.backdrop} onPress={onClose} />
+        <View style={[voiceStyles.sheet, { backgroundColor: colors.surface }]}>
+          {/* Handle */}
+          <View style={[voiceStyles.handle, { backgroundColor: colors.border }]} />
+
+          {/* Title */}
+          <Text style={[voiceStyles.title, { color: colors.foreground }]}>
+            {isRTL ? "البحث الصوتي" : "Voice Search"}
+          </Text>
+          <Text style={[voiceStyles.subtitle, { color: colors.muted }]}>
+            {status === "idle"
+              ? isRTL ? "اضغط للتحدث عن وجهتك" : "Tap to speak your destination"
+              : status === "recording"
+              ? isRTL ? "جاري التسجيل... اضغط للإيقاف" : "Recording... tap to stop"
+              : status === "processing"
+              ? isRTL ? "جاري التعرف على الصوت..." : "Processing your voice..."
+              : status === "done"
+              ? isRTL ? "تم التعرف!" : "Recognized!"
+              : isRTL ? "تعذر التعرف على الصوت. يمكنك الكتابة يدويًا بالأسفل." : "Voice recognition failed. You can type manually below."}
+          </Text>
+
+          {/* Wave animation */}
+          <View style={voiceStyles.waveContainer}>
+            {bars.map((bar, i) => (
+              <Animated.View
+                key={i}
+                style={[
+                  voiceStyles.wavebar,
+                  {
+                    backgroundColor: status === "recording" ? "#EF4444" : colors.primary,
+                    transform: [{ scaleY: bar }],
+                  },
+                ]}
+              />
+            ))}
+          </View>
+
+          {/* Mic button */}
+          <Pressable
+            style={({ pressed }) => [
+              voiceStyles.micButton,
+              { backgroundColor: micBg, opacity: pressed ? 0.8 : 1 },
+            ]}
+            onPress={handleMicPress}
+            disabled={status === "processing" || status === "done"}
+          >
+            <IconSymbol
+              name={status === "recording" ? "stop.fill" : "mic.fill"}
+              size={36}
+              color={micColor}
+            />
+          </Pressable>
+
+          {/* Result text */}
+          {resultText ? (
+            <View style={[voiceStyles.resultBox, { backgroundColor: colors.primary + "12", borderColor: colors.primary + "30" }]}>
+              <IconSymbol name="checkmark.circle.fill" size={18} color={colors.success} />
+              <Text style={[voiceStyles.resultText, { color: colors.foreground }]}>{resultText}</Text>
+            </View>
+          ) : null}
+
+          {/* Manual fallback */}
+          {(status === "idle" || status === "error") ? (
+            <View style={voiceStyles.manualBox}>
+              <TextInput
+                value={manualText}
+                onChangeText={setManualText}
+                placeholder={isRTL ? "اكتب المدينة أو المطار هنا" : "Type city or airport here"}
+                placeholderTextColor={colors.muted}
+                style={[voiceStyles.manualInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.background, textAlign: isRTL ? "right" : "left" }]}
+              />
+              <Pressable style={[voiceStyles.useTextBtn, { backgroundColor: colors.primary }]} onPress={submitManualText}>
+                <Text style={voiceStyles.useTextBtnText}>{isRTL ? "استخدام النص" : "Use text"}</Text>
+              </Pressable>
+            </View>
+          ) : null}
+
+          {/* Cancel */}
+          <Pressable style={voiceStyles.cancelBtn} onPress={onClose}>
+            <Text style={[voiceStyles.cancelText, { color: colors.muted }]}>
+              {isRTL ? "إلغاء" : "Cancel"}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+// ── Main Home Screen ──────────────────────────────────────────────────────────
+
+export default function HomeScreen() {
+  const router = useRouter();
+  const colors = useColors();
+  const { user } = useApp();
+  const { t, isRTL, language } = useTranslation();
+  const [activeTab, setActiveTab] = useState<SearchTab>("flights");
+
+  // Voice search modal
+  const [voiceModalVisible, setVoiceModalVisible] = useState(false);
+  // Which field is voice targeting: "flightTo" | "flightFrom" | "hotelDest" | "activityDest"
+  const [voiceTarget, setVoiceTarget] = useState<"flightTo" | "flightFrom" | "hotelDest" | "activityDest">("flightTo");
+
+  // Trip type
+  const [tripType, setTripType] = useState<TripType>("oneway");
+
+  // Multi-city legs state (min 2, max 5)
+  const [multiCityLegs, setMultiCityLegs] = useState([
+    { from: "Casablanca", fromCode: "CMN", to: "", toCode: "", date: futureDate(30) },
+    { from: "", fromCode: "", to: "", toCode: "", date: futureDate(37) },
+  ]);
+
+  const addMultiCityLeg = () => {
+    if (multiCityLegs.length >= 5) return;
+    const lastLeg = multiCityLegs[multiCityLegs.length - 1];
+    setMultiCityLegs((prev) => [
+      ...prev,
+      { from: lastLeg.to, fromCode: lastLeg.toCode, to: "", toCode: "", date: futureDate(37 + prev.length * 7) },
+    ]);
+  };
+
+  const removeMultiCityLeg = (index: number) => {
+    if (multiCityLegs.length <= 2) return;
+    setMultiCityLegs((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const updateMultiCityLeg = (index: number, field: string, value: string) => {
+    setMultiCityLegs((prev) => {
+      const next = [...prev];
+      next[index] = { ...next[index], [field]: value };
+      // Auto-fill next leg's origin from this leg's destination
+      if (field === "to" && index + 1 < next.length) {
+        next[index + 1] = { ...next[index + 1], from: value };
+      }
+      if (field === "toCode" && index + 1 < next.length) {
+        next[index + 1] = { ...next[index + 1], fromCode: value };
+      }
+      return next;
+    });
+  };
+
+  // Flexible dates (±3 days)
+  const [flexibleDates, setFlexibleDates] = useState(false);
+
+  // Cabin class
+  const [cabinClass, setCabinClass] = useState<CabinClass>("ECONOMY");
+
+  // Flight search state
+  const [flightFrom, setFlightFrom] = useState("Casablanca");
+  const [flightFromCode, setFlightFromCode] = useState("CMN");
+  const [flightTo, setFlightTo] = useState("");
+  const [flightToCode, setFlightToCode] = useState("");
+  const [departureDate, setDepartureDate] = useState(futureDate(30));
+  const [returnDate, setReturnDate] = useState(futureDate(37));
+  const [passengers, setPassengers] = useState(1);
+
+  // Children count
+  const [children, setChildren] = useState(0);
+  // Child dates of birth (one per child)
+  const [childDobs, setChildDobs] = useState<string[]>([]);
+  // Infant count (under 2 years)
+  const [infants, setInfants] = useState(0);
+  const [hotelChildren, setHotelChildren] = useState(0);
+
+  // Sync childDobs array length with children count
+  React.useEffect(() => {
+    setChildDobs((prev) => {
+      if (children > prev.length) {
+        return [...prev, ...Array(children - prev.length).fill("")];
+      }
+      return prev.slice(0, children);
+    });
+  }, [children]);
+
+  const updateChildDob = (index: number, value: string) => {
+    setChildDobs((prev) => {
+      const next = [...prev];
+      next[index] = value;
+      return next;
+    });
+  };
+
+  // Calculate child ages from DOBs for Duffel API
+  const getChildAges = (): number[] => {
+    return childDobs.map((dob) => {
+      if (!dob) return 5; // default age if not set
+      const birthDate = new Date(dob);
+      const today = new Date();
+      let age = today.getFullYear() - birthDate.getFullYear();
+      const m = today.getMonth() - birthDate.getMonth();
+      if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) age--;
+      return Math.max(2, Math.min(age, 11)); // clamp between 2-11
+    });
+  };
+
+  // Bags count
+  const [bags, setBags] = useState(1);
+
+  // Hotel search state
+  const [hotelDest, setHotelDest] = useState("");
+  const [hotelDestCode, setHotelDestCode] = useState("");
+  const [checkIn, setCheckIn] = useState(futureDate(30));
+  const [checkOut, setCheckOut] = useState(futureDate(33));
+  const [guests, setGuests] = useState(2);
+
+  // Activities search state
+  const [activityDest, setActivityDest] = useState("");
+  const [activityDestCode, setActivityDestCode] = useState("");
+  const [activityFrom, setActivityFrom] = useState(futureDate(0));
+  const [activityTo, setActivityTo] = useState(futureDate(7));
+  const [activityChildren, setActivityChildren] = useState(0);
+  const [activityLanguage, setActivityLanguage] = useState("en"); // en, ar, fr, pt
+
+  // Swap origin ↔ destination
+  const handleSwap = () => {
+    const tmpName = flightFrom;
+    const tmpCode = flightFromCode;
+    setFlightFrom(flightTo || "");
+    setFlightFromCode(flightToCode || "");
+    setFlightTo(tmpName);
+    setFlightToCode(tmpCode);
+  };
+
+  const handleMultiCitySearch = () => {
+    // Validate all legs
+    for (let i = 0; i < multiCityLegs.length; i++) {
+      const leg = multiCityLegs[i];
+      if (!leg.fromCode || !leg.from) {
+        Alert.alert(isRTL ? "خطأ" : "Missing Origin", `${isRTL ? "يرجى اختيار مطار الإقلاع للرحلة" : "Please select departure airport for leg"} ${i + 1}`);
+        return;
+      }
+      if (!leg.toCode || !leg.to) {
+        Alert.alert(isRTL ? "خطأ" : "Missing Destination", `${isRTL ? "يرجى اختيار مطار الوصول للرحلة" : "Please select destination airport for leg"} ${i + 1}`);
+        return;
+      }
+    }
+    // Multi-city search coming soon
+    Alert.alert(
+      isRTL ? 'قريباً' : 'Coming Soon',
+      isRTL ? 'البحث متعدد المدن سيكون متاحاً قريباً.' : 'Multi-city search will be available soon.'
+    );
+  };
+
+  const handleFlightSearch = () => {
+    if (!flightToCode || !flightTo) {
+      Alert.alert(
+        isRTL ? "خطأ" : "Missing Destination",
+        isRTL ? "يرجى اختيار وجهة السفر" : "Please select a destination airport."
+      );
+      return;
+    }
+    if (!flightFromCode || !flightFrom) {
+      Alert.alert(
+        isRTL ? "خطأ" : "Missing Origin",
+        isRTL ? "يرجى اختيار مطار المغادرة" : "Please select a departure airport."
+      );
+      return;
+    }
+    router.push({
+      pathname: "/flights/results" as any,
+      params: {
+        origin: flightFrom,
+        originCode: flightFromCode,
+        destination: flightTo,
+        destinationCode: flightToCode,
+        date: departureDate,
+        returnDate: tripType === "roundtrip" ? returnDate : "",
+        tripType,
+        passengers: passengers.toString(),
+        children: children.toString(),
+        infants: infants.toString(),
+        childAges: JSON.stringify(getChildAges()),
+        childDobs: JSON.stringify(childDobs),
+        cabinClass,
+        bags: bags.toString(),
+        useMock: "false",
+        flexibleDates: flexibleDates ? "true" : "false",
+      },
+    });
+  };
+
+  const handleActivitySearch = () => {
+    const code = (activityDestCode || activityDest).trim().toUpperCase();
+    if (!code) {
+      Alert.alert(
+        isRTL ? "خطأ" : "Missing Destination",
+        isRTL ? "يرجى اختيار وجهة النشاط" : "Please select an activity destination."
+      );
+      return;
+    }
+    router.push({
+      pathname: "/activities" as any,
+      params: {
+        destinationCode: code,
+        destName: activityDest,
+        fromDate: activityFrom,
+        toDate: activityTo,
+        children: activityChildren.toString(),
+        language: activityLanguage,
+      },
+    });
+  };
+
+  const handleHotelSearch = () => {
+    if (!hotelDestCode || !hotelDest) {
+      Alert.alert(
+        isRTL ? "خطأ" : "Missing Destination",
+        isRTL ? "يرجى اختيار مدينة الوجهة" : "Please select a destination city."
+      );
+      return;
+    }
+    router.push({
+      pathname: "/hotels/results" as any,
+      params: {
+        destination: hotelDest,
+        destinationCode: hotelDestCode,
+        checkIn,
+        checkOut,
+        guests: guests.toString(),
+        children: hotelChildren.toString(),
+        useMock: "false",
+      },
+    });
+  };
+
+  // Handle voice search result
+  const handleVoiceResult = (text: string) => {
+    // The text is a raw transcription — use it as destination name
+    // We set the text as the destination value; user can refine via autocomplete
+    if (voiceTarget === "flightTo") {
+      setFlightTo(text);
+      setFlightToCode(""); // will be resolved when user picks from autocomplete
+    } else if (voiceTarget === "flightFrom") {
+      setFlightFrom(text);
+      setFlightFromCode("");
+    } else if (voiceTarget === "hotelDest") {
+      setHotelDest(text);
+      setHotelDestCode("");
+    } else if (voiceTarget === "activityDest") {
+      setActivityDest(text);
+      setActivityDestCode("");
+    }
+  };
+
+  const openVoiceSearch = (target: "flightTo" | "flightFrom" | "hotelDest" | "activityDest") => {
+    setVoiceTarget(target);
+    setVoiceModalVisible(true);
+  };
+
+  const greeting = () => {
+    return t.home.greeting;
+  };
+
+  return (
+    <ScreenContainer containerClassName="bg-primary" edges={["top", "left", "right"]}>
+      <ScrollView 
+        showsVerticalScrollIndicator={false} 
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingBottom: 120 }}
+      >
+        {/* Header */}
+        <View style={[styles.header, { backgroundColor: "#1E3A8A" }]}>
+          <View style={styles.headerTop}>
+            <View>
+              <Text style={styles.greeting}>{greeting()},</Text>
+              <Text style={[styles.userName, { textAlign: isRTL ? "right" : "left" }]}>
+                {user?.name?.split(" ")[0] ?? (isRTL ? "مسافر" : "Traveller")}
+              </Text>
+            </View>
+            <Pressable
+              style={[styles.notifButton, { backgroundColor: "rgba(255,255,255,0.15)" }]}
+              onPress={() => router.push("/pnr-status" as any)}
+            >
+              <IconSymbol name="bell.fill" size={20} color="#FFFFFF" />
+            </Pressable>
+          </View>
+          <Text style={[styles.headerSubtitle, { textAlign: isRTL ? "right" : "left" }]}>{t.home.tagline}</Text>
+        </View>
+
+        {/* Search Widget */}
+        <View style={[styles.searchWidget, { backgroundColor: "#FFFFFF" }]}>
+          {/* Premium Service Tabs: Flights / Hotels / Activities / eSIM / Visas / Insurance */}
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.tabScrollContent}
+            style={[styles.tabRow, { backgroundColor: "#F8FAFC" }]}
+          >
+            {[
+              { key: "flights", label: t.home.flights, icon: "airplane", action: () => setActiveTab("flights" as SearchTab) },
+              { key: "hotels", label: t.home.hotels, icon: "building.2.fill", action: () => setActiveTab("hotels" as SearchTab) },
+              { key: "activities", label: t.home.activities, icon: "binoculars.fill", action: () => setActiveTab("activities" as SearchTab), activeColor: "#10B981" },
+              { key: "esim", label: "eSIM", icon: "globe", action: () => router.push("/(tabs)/esim" as any), activeColor: "#06B6D4" },
+              { key: "visas", label: isRTL ? "تأشيرات" : "Visas", icon: "doc.text.fill", action: () => router.push("/visas" as any), activeColor: "#8B5CF6" },
+              { key: "insurance", label: isRTL ? "تأمين" : "Insurance", icon: "shield.fill", action: () => router.push("/insurance" as any), activeColor: "#EC4899" },
+            ].map((tab) => {
+              const isSearchTab = tab.key === "flights" || tab.key === "hotels" || tab.key === "activities";
+              const isActive = isSearchTab && activeTab === tab.key;
+              const activeBg = tab.activeColor || colors.primary;
+              return (
+                <Pressable
+                  key={tab.key}
+                  style={[
+                    styles.tabButton,
+                    isActive && { backgroundColor: activeBg },
+                  ]}
+                  onPress={tab.action}
+                >
+                  <IconSymbol
+                    name={tab.icon as any}
+                    size={16}
+                    color={isActive ? "#FFFFFF" : (tab.activeColor || colors.primary)}
+                  />
+                  <Text
+                    style={[
+                      styles.tabLabel,
+                      { color: isActive ? "#FFFFFF" : colors.foreground },
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {tab.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+
+          {activeTab === "flights" ? (
+            <View style={styles.searchForm}>
+
+              {/* ── Trip Type Toggle ── */}
+              <View style={[styles.tripTypeRow, { backgroundColor: colors.background, borderColor: colors.border }]}>
+                 {(["oneway", "roundtrip", "multicity"] as TripType[]).map((type) => (
+                  <Pressable
+                    key={type}
+                    style={[
+                      styles.tripTypeBtn,
+                      tripType === type && { backgroundColor: colors.primary },
+                    ]}
+                    onPress={() => setTripType(type)}
+                  >
+                    <IconSymbol
+                      name={type === "oneway" ? "arrow.right" : "arrow.2.squarepath"}
+                      size={14}
+                      color={tripType === type ? "#FFFFFF" : colors.muted}
+                    />
+                    <Text
+                      style={[
+                        styles.tripTypeText,
+                        { color: tripType === type ? "#FFFFFF" : colors.muted },
+                      ]}
+                    >
+                      {type === "oneway" ? (isRTL ? "ذهاب فقط" : "One Way") : type === "roundtrip" ? (isRTL ? "ذهاب وعودة" : "Round Trip") : (isRTL ? "متعدد المدن" : "Multi-City")}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              {/* ── Multi-City Form ── */}
+              {tripType === "multicity" && (
+                <View style={{ gap: 8 }}>
+                  {multiCityLegs.map((leg, index) => (
+                    <View key={index} style={[styles.multiLegCard, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+                      <View style={[styles.multiLegHeader, { borderBottomColor: colors.border }]}>
+                        <Text style={[styles.multiLegTitle, { color: colors.primary }]}>
+                          {isRTL ? `الرحلة ${index + 1}` : `Flight ${index + 1}`}
+                        </Text>
+                        {multiCityLegs.length > 2 && (
+                          <Pressable onPress={() => removeMultiCityLeg(index)} style={styles.multiLegRemove}>
+                            <MaterialIcons name="close" size={16} color={colors.error || "#EF4444"} />
+                          </Pressable>
+                        )}
+                      </View>
+                      <LocationAutocomplete
+                        label={isRTL ? "من" : "From"}
+                        placeholder={isRTL ? "مطار الإقلاع" : "Departure airport"}
+                        value={leg.from}
+                        iataCode={leg.fromCode}
+                        onSelect={(name, code) => {
+                          updateMultiCityLeg(index, "from", name);
+                          updateMultiCityLeg(index, "fromCode", code);
+                        }}
+                        iconName="airplane"
+                      />
+                      <LocationAutocomplete
+                        label={isRTL ? "إلى" : "To"}
+                        placeholder={isRTL ? "مطار الوصول" : "Arrival airport"}
+                        value={leg.to}
+                        iataCode={leg.toCode}
+                        onSelect={(name, code) => {
+                          updateMultiCityLeg(index, "to", name);
+                          updateMultiCityLeg(index, "toCode", code);
+                        }}
+                        iconName="location.fill"
+                      />
+                      <DatePickerField
+                        label={isRTL ? "تاريخ السفر" : "Travel Date"}
+                        value={leg.date}
+                        onChange={(d) => updateMultiCityLeg(index, "date", d)}
+                        minimumDate={index > 0 ? new Date(multiCityLegs[index - 1].date) : new Date()}
+                        backgroundColor={colors.background}
+                        icon={<IconSymbol name="calendar" size={18} color={colors.primary} />}
+                      />
+                    </View>
+                  ))}
+                  {multiCityLegs.length < 5 && (
+                    <Pressable
+                      style={[styles.addLegBtn, { borderColor: colors.primary, backgroundColor: colors.primary + "12" }]}
+                      onPress={addMultiCityLeg}
+                    >
+                      <MaterialIcons name="add" size={18} color={colors.primary} />
+                      <Text style={[styles.addLegText, { color: colors.primary }]}>
+                        {isRTL ? "إضافة رحلة" : "Add Flight"}
+                      </Text>
+                    </Pressable>
+                  )}
+                </View>
+              )}
+
+              {/* From — with autocomplete + voice */}
+              {tripType !== "multicity" && (
+                <LocationAutocomplete
+                  label={t.home.from}
+                  placeholder={isRTL ? "مدينة أو مطار الإقلاع" : "Origin city or airport"}
+                  value={flightFrom}
+                  iataCode={flightFromCode}
+                  onSelect={(name, code) => {
+                    setFlightFrom(name);
+                    setFlightFromCode(code);
+                  }}
+                  iconName="airplane"
+                  onVoicePress={() => openVoiceSearch("flightFrom")}
+                />
+              )}
+
+              {/* Swap button */}
+              {tripType !== "multicity" && (
+                <View style={styles.swapRow}>
+                  <View style={[styles.swapDivider, { backgroundColor: colors.border }]} />
+                  <Pressable
+                    style={[styles.swapBtn, { backgroundColor: colors.primary, borderColor: colors.surface }]}
+                    onPress={handleSwap}
+                  >
+                    <IconSymbol name="arrow.up.arrow.down" size={16} color="#FFFFFF" />
+                  </Pressable>
+                  <View style={[styles.swapDivider, { backgroundColor: colors.border }]} />
+                </View>
+              )}
+
+              {/* To — with autocomplete + voice */}
+              {tripType !== "multicity" && (
+                <LocationAutocomplete
+                  label={t.home.to}
+                  placeholder={isRTL ? "مدينة أو مطار الوجهة" : "Destination city or airport"}
+                  value={flightTo}
+                  iataCode={flightToCode}
+                  onSelect={(name, code) => {
+                    setFlightTo(name);
+                    setFlightToCode(code);
+                  }}
+                  iconName="location.fill"
+                  onVoicePress={() => openVoiceSearch("flightTo")}
+                />
+              )}
+
+              {/* Date fields (only for one-way and round-trip) */}
+              {tripType !== "multicity" && (
+                tripType === "oneway" ? (
+                  /* One Way — single date */
+                  <DatePickerField
+                    label={t.home.departure}
+                    value={departureDate}
+                    onChange={(d) => setDepartureDate(d)}
+                    minimumDate={new Date()}
+                    backgroundColor={colors.background}
+                    icon={<IconSymbol name="calendar" size={18} color={colors.primary} />}
+                  />
+                ) : (
+                  /* Round Trip — two dates stacked vertically for better mobile layout */
+                  <View style={styles.datesColumn}>
+                    <DatePickerField
+                      label={t.home.departure}
+                      value={departureDate}
+                      onChange={(d) => {
+                        setDepartureDate(d);
+                        const dep = new Date(d);
+                        const ret = new Date(returnDate);
+                        if (ret <= dep) {
+                          dep.setDate(dep.getDate() + 3);
+                          setReturnDate(dep.toISOString().slice(0, 10));
+                        }
+                      }}
+                      minimumDate={new Date()}
+                      backgroundColor={colors.background}
+                      icon={<IconSymbol name="airplane" size={16} color={colors.primary} />}
+                    />
+                    <View style={[styles.dateSeparator, { backgroundColor: colors.border }]} />
+                    <DatePickerField
+                      label={t.home.returnDate}
+                      value={returnDate}
+                      onChange={(d) => setReturnDate(d)}
+                      minimumDate={new Date(departureDate)}
+                      backgroundColor={colors.background}
+                      icon={<IconSymbol name="airplane.arrival" size={16} color={colors.secondary} />}
+                    />
+                  </View>
+                )
+              )}
+
+              {/* Passengers + Children + Infants + Bags — compact grid */}
+              <View style={[styles.passengersCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
+                {/* Adults */}
+                <View style={styles.counterItem}>
+                  <View style={styles.counterItemLeft}>
+                    <IconSymbol name="person.2.fill" size={16} color={colors.primary} />
+                    <Text style={[styles.counterItemLabel, { color: colors.foreground }]}>{t.home.passengers}</Text>
+                  </View>
+                  <View style={styles.counterBtns}>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setPassengers(Math.max(1, passengers - 1))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>−</Text>
+                    </Pressable>
+                    <Text style={[styles.counterNum, { color: colors.foreground }]}>{passengers}</Text>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setPassengers(passengers + 1)}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>+</Text>
+                    </Pressable>
+                  </View>
+                </View>
+                <View style={[styles.counterDivider, { backgroundColor: colors.border }]} />
+                {/* Children */}
+                <View style={styles.counterItem}>
+                  <View style={styles.counterItemLeft}>
+                    <IconSymbol name="figure.and.child.holdinghands" size={16} color={colors.primary} />
+                    <Text style={[styles.counterItemLabel, { color: colors.foreground }]}>{isRTL ? "أطفال (2-11)" : "Children (2-11)"}</Text>
+                  </View>
+                  <View style={styles.counterBtns}>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setChildren(Math.max(0, children - 1))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>−</Text>
+                    </Pressable>
+                    <Text style={[styles.counterNum, { color: colors.foreground }]}>{children}</Text>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setChildren(children + 1)}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>+</Text>
+                    </Pressable>
+                  </View>
+                </View>
+
+              </View>
+
+              {/* Child DOB fields */}
+              {children > 0 && (
+                <View style={[styles.searchField, { borderColor: colors.border, backgroundColor: colors.background, flexDirection: "column", alignItems: "stretch" }]}>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <IconSymbol name="figure.and.child.holdinghands" size={18} color={colors.primary} />
+                    <Text style={[styles.fieldLabel, { color: colors.muted, marginBottom: 0 }]}>
+                      {isRTL ? "تاريخ ميلاد الأطفال (2-11 سنة)" : "Children Date of Birth (2-11 years)"}
+                    </Text>
+                  </View>
+                  {childDobs.map((dob, idx) => (
+                    <View key={`child-dob-${idx}`} style={{ marginBottom: idx < children - 1 ? 8 : 0 }}>
+                      <Text style={{ fontSize: 12, color: colors.muted, marginBottom: 4 }}>
+                        {isRTL ? `طفل ${idx + 1}` : `Child ${idx + 1}`}
+                      </Text>
+                      <DatePickerField
+                        value={dob}
+                        onChange={(d) => updateChildDob(idx, d)}
+                        placeholder={isRTL ? "اختر تاريخ الميلاد" : "Select date of birth"}
+                        maximumDate={new Date(new Date().setFullYear(new Date().getFullYear() - 2))}
+                        minimumDate={new Date(new Date().setFullYear(new Date().getFullYear() - 12))}
+                        backgroundColor={colors.background}
+                        compact
+                      />
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {/* Infants + Bags — second card */}
+              <View style={[styles.passengersCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
+                <View style={styles.counterItem}>
+                  <View style={styles.counterItemLeft}>
+                    <IconSymbol name="heart.fill" size={16} color={colors.primary} />
+                    <Text style={[styles.counterItemLabel, { color: colors.foreground }]}>{isRTL ? "رضع (أقل من سنتين)" : "Infants (under 2)"}</Text>
+                  </View>
+                  <View style={styles.counterBtns}>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setInfants(Math.max(0, infants - 1))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>−</Text>
+                    </Pressable>
+                    <Text style={[styles.counterNum, { color: colors.foreground }]}>{infants}</Text>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setInfants(Math.min(infants + 1, passengers))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>+</Text>
+                    </Pressable>
+                  </View>
+                </View>
+                <View style={[styles.counterDivider, { backgroundColor: colors.border }]} />
+                <View style={styles.counterItem}>
+                  <View style={styles.counterItemLeft}>
+                    <MaterialIcons name="luggage" size={18} color={colors.muted} />
+                    <Text style={[styles.counterItemLabel, { color: colors.foreground }]}>{isRTL ? "الحقائب" : "Bags"}</Text>
+                  </View>
+                  <View style={styles.counterBtns}>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setBags(Math.max(0, bags - 1))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>−</Text>
+                    </Pressable>
+                    <Text style={[styles.counterNum, { color: colors.foreground }]}>{bags}</Text>
+                    <Pressable style={[styles.counterCircle, { borderColor: colors.border }]} onPress={() => setBags(Math.min(bags + 1, 3))}>
+                      <Text style={[styles.counterCircleText, { color: colors.primary }]}>+</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              </View>
+
+              {/* Cabin Class Selector */}
+              <View style={[styles.searchField, { borderColor: colors.border, backgroundColor: colors.background }]}>
+                <IconSymbol name="airplane" size={18} color={colors.primary} />
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.fieldLabel, { color: colors.muted }]}>
+                    {isRTL ? "درجة السفر" : "Cabin Class"}
+                  </Text>
+                  <View style={styles.cabinRow}>
+                    {([
+                      { key: "ECONOMY", ar: "اقتصادية", en: "Economy" },
+                      { key: "PREMIUM_ECONOMY", ar: "ممتازة", en: "Premium" },
+                      { key: "BUSINESS", ar: "أعمال", en: "Business" },
+                      { key: "FIRST", ar: "أولى", en: "First" },
+                    ] as { key: CabinClass; ar: string; en: string }[]).map((cls) => (
+                      <Pressable
+                        key={cls.key}
+                        onPress={() => setCabinClass(cls.key)}
+                        style={[
+                          styles.cabinBtn,
+                          {
+                            backgroundColor: cabinClass === cls.key ? colors.primary : colors.surface,
+                            borderColor: cabinClass === cls.key ? colors.primary : colors.border,
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.cabinBtnText,
+                            { color: cabinClass === cls.key ? "#fff" : colors.foreground },
+                          ]}
+                        >
+                          {isRTL ? cls.ar : cls.en}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              </View>
+
+              {/* Flexible Dates Toggle (only for one-way/round-trip) */}
+              {tripType !== "multicity" && (
+                <Pressable
+                  style={[styles.flexibleToggle, { borderColor: flexibleDates ? colors.primary : colors.border, backgroundColor: flexibleDates ? colors.primary + "18" : colors.background }]}
+                  onPress={() => setFlexibleDates(!flexibleDates)}
+                >
+                  <View style={[styles.flexibleCheckbox, { borderColor: flexibleDates ? colors.primary : colors.border, backgroundColor: flexibleDates ? colors.primary : "transparent" }]}>
+                    {flexibleDates && <IconSymbol name="checkmark" size={12} color="#fff" />}
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.flexibleTitle, { color: flexibleDates ? colors.primary : colors.foreground }]}>
+                      {isRTL ? "تواريخ مرنة (±3 أيام)" : "Flexible Dates (±3 days)"}
+                    </Text>
+                    <Text style={[styles.flexibleSub, { color: colors.muted }]}>
+                      {isRTL ? "سنبحث في 7 تواريخ ونعرض أفضل سعر لكل يوم" : "We'll search 7 dates and show the best price per day"}
+                    </Text>
+                  </View>
+                  <IconSymbol name="calendar.badge.clock" size={20} color={flexibleDates ? colors.primary : colors.muted} />
+                </Pressable>
+              )}
+
+              <Pressable
+                style={({ pressed }) => [
+                  styles.searchButton,
+                  { backgroundColor: "#1E3A8A", borderColor: "#D4AF37", borderWidth: 1.5, opacity: pressed ? 0.85 : 1 },
+                ]}
+                onPress={tripType === "multicity" ? handleMultiCitySearch : handleFlightSearch}
+              >
+                <IconSymbol name="magnifyingglass" size={18} color="#D4AF37" />
+                <Text style={[styles.searchButtonText, { color: "#FFFFFF" }]}>
+                  {tripType === "multicity" ? (isRTL ? "بحث متعدد المدن" : "Search Multi-City") : tripType === "roundtrip" ? t.home.roundTrip : t.home.searchFlights}
+                </Text>
+              </Pressable>
+            </View>
+          ) : activeTab === "activities" ? (
+            /* ── Activities Form ── */
+            <View style={styles.searchForm}>
+              {/* Activity destination + voice */}
+              <LocationAutocomplete
+                label={t.home.destination}
+                placeholder={isRTL ? "مدينة أو وجهة النشاط" : "City or activity destination"}
+                value={activityDest}
+                iataCode={activityDestCode}
+                onSelect={(name, code) => {
+                  setActivityDest(name);
+                  setActivityDestCode(code);
+                }}
+                iconName="location.fill"
+                onVoicePress={() => openVoiceSearch("activityDest")}
+              />
+
+              {/* Date range */}
+              <View style={styles.rowFields}>
+                <View style={{ flex: 1 }}>
+                  <DatePickerField
+                    label={t.home.activityFrom}
+                    value={activityFrom}
+                    onChange={(d) => {
+                      setActivityFrom(d);
+                      const af = new Date(d);
+                      const at = new Date(activityTo);
+                      if (at <= af) {
+                        af.setDate(af.getDate() + 7);
+                        setActivityTo(af.toISOString().slice(0, 10));
+                      }
+                    }}
+                    minimumDate={new Date()}
+                    backgroundColor={colors.background}
+                    icon={<IconSymbol name="clock.fill" size={18} color="#10B981" />}
+                  />
+                </View>
+                <View style={[styles.dateArrow, { marginTop: 20 }]}>
+                  <IconSymbol name="arrow.right" size={14} color={colors.muted} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <DatePickerField
+                    label={t.home.activityTo}
+                    value={activityTo}
+                    onChange={(d) => setActivityTo(d)}
+                    minimumDate={new Date(activityFrom)}
+                    backgroundColor={colors.background}
+                    icon={<IconSymbol name="clock.fill" size={18} color="#10B981" />}
+                  />
+                </View>
+              </View>
+
+              {/* Children & Language row */}
+              <View style={styles.rowFields}>
+                {/* Children counter */}
+                <View style={{ flex: 1, backgroundColor: colors.background, borderRadius: 12, padding: 10, borderWidth: 1, borderColor: colors.border }}>
+                  <Text style={{ fontSize: 11, color: colors.muted, marginBottom: 4 }}>{isRTL ? "أطفال (0-12)" : "Children (0-12)"}</Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between" }}>
+                    <Pressable
+                      style={{ width: 28, height: 28, borderRadius: 14, backgroundColor: "#10B981" + "20", alignItems: "center", justifyContent: "center" }}
+                      onPress={() => setActivityChildren(Math.max(0, activityChildren - 1))}
+                    >
+                      <Text style={{ color: "#10B981", fontSize: 18, fontWeight: "700", lineHeight: 22 }}>−</Text>
+                    </Pressable>
+                    <Text style={{ fontSize: 16, fontWeight: "700", color: colors.foreground }}>{activityChildren}</Text>
+                    <Pressable
+                      style={{ width: 28, height: 28, borderRadius: 14, backgroundColor: "#10B981" + "20", alignItems: "center", justifyContent: "center" }}
+                      onPress={() => setActivityChildren(Math.min(10, activityChildren + 1))}
+                    >
+                      <Text style={{ color: "#10B981", fontSize: 18, fontWeight: "700", lineHeight: 22 }}>+</Text>
+                    </Pressable>
+                  </View>
+                </View>
+
+                {/* Language selector */}
+                <View style={{ flex: 1, backgroundColor: colors.background, borderRadius: 12, padding: 10, borderWidth: 1, borderColor: colors.border }}>
+                  <Text style={{ fontSize: 11, color: colors.muted, marginBottom: 4 }}>{isRTL ? "لغة الأوصاف" : "Description Language"}</Text>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 4 }}>
+                    {(["ar", "en", "fr", "pt"] as const).map((lang) => (
+                      <Pressable
+                        key={lang}
+                        style={{ paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8, backgroundColor: activityLanguage === lang ? "#10B981" : colors.surface, borderWidth: 1, borderColor: activityLanguage === lang ? "#10B981" : colors.border }}
+                        onPress={() => setActivityLanguage(lang)}
+                      >
+                        <Text style={{ fontSize: 11, fontWeight: "600", color: activityLanguage === lang ? "#fff" : colors.muted }}>
+                          {lang === "ar" ? "عر" : lang === "en" ? "EN" : lang === "fr" ? "FR" : "PT"}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              </View>
+
+              {/* Search button */}
+              <Pressable
+                style={({ pressed }) => [
+                  styles.searchButton,
+                  { backgroundColor: "#10B981", opacity: pressed ? 0.85 : 1 },
+                ]}
+                onPress={handleActivitySearch}
+              >
+                <IconSymbol name="magnifyingglass" size={18} color="#FFFFFF" />
+                <Text style={[styles.searchButtonText, { color: "#FFFFFF" }]}>{t.home.searchActivities}</Text>
+              </Pressable>
+            </View>
+          ) : (
+            /* ── Hotels Form ── */
+            <View style={styles.searchForm}>
+              {/* Hotel destination + voice */}
+              <LocationAutocomplete
+                label={t.home.destination}
+                placeholder={isRTL ? "مدينة أو وجهة الفندق" : "City or hotel destination"}
+                value={hotelDest}
+                iataCode={hotelDestCode}
+                onSelect={(name, code) => {
+                  setHotelDest(name);
+                  setHotelDestCode(code);
+                }}
+                iconName="location.fill"
+                onVoicePress={() => openVoiceSearch("hotelDest")}
+              />
+
+              <View style={styles.rowFields}>
+                <View style={{ flex: 1 }}>
+                  <DatePickerField
+                    label={t.home.checkIn}
+                    value={checkIn}
+                    onChange={(d) => {
+                      setCheckIn(d);
+                      const ci = new Date(d);
+                      const co = new Date(checkOut);
+                      if (co <= ci) {
+                        ci.setDate(ci.getDate() + 1);
+                        setCheckOut(ci.toISOString().slice(0, 10));
+                      }
+                    }}
+                    minimumDate={new Date()}
+                    backgroundColor={colors.background}
+                    icon={<IconSymbol name="clock.fill" size={18} color={colors.primary} />}
+                  />
+                </View>
+                <View style={[styles.dateArrow, { marginTop: 20 }]}>
+                  <IconSymbol name="arrow.right" size={14} color={colors.muted} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <DatePickerField
+                    label={t.home.checkOut}
+                    value={checkOut}
+                    onChange={(d) => setCheckOut(d)}
+                    minimumDate={new Date(checkIn)}
+                    backgroundColor={colors.background}
+                    icon={<IconSymbol name="clock.fill" size={18} color={colors.primary} />}
+                  />
+                </View>
+              </View>
+
+              <View style={styles.rowFields}>
+                <View style={[styles.searchField, { flex: 1, borderColor: colors.border, backgroundColor: colors.background }]}>
+                  <IconSymbol name="person.2.fill" size={18} color={colors.primary} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.fieldLabel, { color: colors.muted }]}>{t.home.guests}</Text>
+                    <View style={styles.counterRow}>
+                      <Pressable onPress={() => setGuests(Math.max(1, guests - 1))}>
+                        <Text style={{ color: colors.primary, fontSize: 20, fontWeight: "700" }}>−</Text>
+                      </Pressable>
+                      <Text style={[styles.fieldValue, { color: colors.foreground }]}>{guests}</Text>
+                      <Pressable onPress={() => setGuests(guests + 1)}>
+                        <Text style={{ color: colors.primary, fontSize: 20, fontWeight: "700" }}>+</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+                <View style={[styles.searchField, { flex: 1, borderColor: colors.border, backgroundColor: colors.background }]}>
+                  <IconSymbol name="figure.and.child.holdinghands" size={18} color={colors.primary} />
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.fieldLabel, { color: colors.muted }]}>{isRTL ? "أطفال" : "Children"}</Text>
+                    <View style={styles.counterRow}>
+                      <Pressable onPress={() => setHotelChildren(Math.max(0, hotelChildren - 1))}>
+                        <Text style={{ color: colors.primary, fontSize: 20, fontWeight: "700" }}>−</Text>
+                      </Pressable>
+                      <Text style={[styles.fieldValue, { color: colors.foreground }]}>{hotelChildren}</Text>
+                      <Pressable onPress={() => setHotelChildren(hotelChildren + 1)}>
+                        <Text style={{ color: colors.primary, fontSize: 20, fontWeight: "700" }}>+</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                </View>
+              </View>
+
+              <Pressable
+                style={({ pressed }) => [
+                  styles.searchButton,
+                  { backgroundColor: "#1E3A8A", borderColor: "#D4AF37", borderWidth: 1.5, opacity: pressed ? 0.85 : 1 },
+                ]}
+                onPress={handleHotelSearch}
+              >
+                <IconSymbol name="magnifyingglass" size={18} color="#D4AF37" />
+                <Text style={[styles.searchButtonText, { color: "#FFFFFF" }]}>{t.home.searchHotels}</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
+
+        {/* Popular Destinations */}
+        <View style={styles.section}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: "#FFFFFF" }]}>{t.home.popularDestinations}</Text>
+            <Pressable>
+              <Text style={[styles.seeAll, { color: "#D4AF37" }]}>{t.seeAll}</Text>
+            </Pressable>
+          </View>
+          <FlatList
+            horizontal
+            data={DESTINATIONS}
+            keyExtractor={(item) => item.id}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 14 }}
+            renderItem={({ item }) => (
+              <Pressable
+                style={({ pressed }) => [styles.destCard, { opacity: pressed ? 0.9 : 1 }]}
+                onPress={() => {
+                  setActiveTab("flights");
+                  setFlightTo(item.city);
+                }}
+              >
+                <Image source={{ uri: item.image }} style={styles.destImage} />
+                <View style={[styles.destTag, { backgroundColor: colors.primary }]}>
+                  <Text style={styles.destTagText}>{item.tag}</Text>
+                </View>
+                <View style={styles.destInfo}>
+                  <Text style={styles.destCity}>{item.city}</Text>
+                  <Text style={styles.destCountry}>{item.country}</Text>
+                  <Text style={styles.destPrice}>{isRTL ? "ابحث الآن" : "Search now"}</Text>
+                </View>
+              </Pressable>
+            )}
+          />
+        </View>
+
+        {/* Services Grid Section */}
+        <View style={[styles.section, { marginBottom: 32 }]}>
+          <Text style={[styles.sectionTitle, { color: "#FFFFFF", marginHorizontal: 20, marginBottom: 16 }]}>{isRTL ? "الخدمات الرئيسية" : "Main Services"}</Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", paddingHorizontal: 12, gap: 10, justifyContent: "space-between" }}>
+            {/* Flights */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => setActiveTab("flights")}
+            >
+              <MaterialIcons name="flight" size={28} color="#0EA5E9" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>{isRTL ? "رحلات" : "Flights"}</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "احجز رحلتك" : "Book Flights"}</Text>
+            </Pressable>
+
+            {/* Hotels */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => setActiveTab("hotels")}
+            >
+              <MaterialIcons name="hotel" size={28} color="#F59E0B" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>{isRTL ? "فنادق" : "Hotels"}</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "ابحث عن فندق" : "Find Hotels"}</Text>
+            </Pressable>
+
+            {/* eSIM */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => router.push("/(tabs)/esim" as any)}
+            >
+              <MaterialIcons name="sim-card" size={28} color="#06B6D4" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>eSIM</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "بطاقة SIM رقمية" : "Digital SIM"}</Text>
+            </Pressable>
+
+            {/* Visas */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => router.push("/visas" as any)}
+            >
+              <MaterialIcons name="approval" size={28} color="#8B5CF6" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>{isRTL ? "تأشيرات" : "Visas"}</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "استخرج تأشيرتك" : "Get Visa"}</Text>
+            </Pressable>
+
+            {/* Insurance */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => router.push("/insurance" as any)}
+            >
+              <MaterialIcons name="security" size={28} color="#EC4899" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>{isRTL ? "تأمين" : "Insurance"}</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "حماية رحلتك" : "Protect Trip"}</Text>
+            </Pressable>
+
+            {/* Activities */}
+            <Pressable
+              style={({ pressed }) => [{
+                width: "48%",
+                height: 140,
+                backgroundColor: "#FFFFFF",
+                borderColor: "#D4AF37",
+                borderWidth: 1.5,
+                borderRadius: 14,
+                padding: 12,
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 6,
+                opacity: pressed ? 0.8 : 1,
+              }]}
+              onPress={() => setActiveTab("activities")}
+            >
+              <MaterialIcons name="tour" size={28} color="#10B981" />
+              <Text style={{ fontSize: 12, fontWeight: "700", color: colors.foreground, textAlign: "center" }}>{isRTL ? "أنشطة" : "Activities"}</Text>
+              <Text style={{ fontSize: 9, color: colors.muted, textAlign: "center" }}>{isRTL ? "اكتشف الأنشطة" : "Explore"}</Text>
+            </Pressable>
+          </View>
+        </View>
+
+
+
+        {/* Partner Registration CTA */}
+        <View style={{ marginHorizontal: 20, marginBottom: 24 }}>
+          <Pressable
+            style={({ pressed }) => [{
+              backgroundColor: "#FFFFFF",
+              borderColor: "#D4AF37",
+              borderWidth: 1.5,
+              borderRadius: 24,
+              padding: 18,
+              flexDirection: "row",
+              alignItems: "center",
+              gap: 14,
+              opacity: pressed ? 0.9 : 1,
+              shadowColor: "#000",
+              shadowOffset: { width: 0, height: 4 },
+              shadowOpacity: 0.16,
+              shadowRadius: 10,
+              elevation: 4,
+            }]}
+            onPress={() => router.push("/partners/register" as any)}
+          >
+            <View style={{ width: 48, height: 48, borderRadius: 14, backgroundColor: "#1E3A8A", alignItems: "center", justifyContent: "center" }}>
+              <MaterialIcons name="handshake" size={26} color="#D4AF37" />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: "#1E3A8A", fontSize: 16, fontWeight: "800", textAlign: isRTL ? "right" : "left" }}>
+                {isRTL ? "انضم كشريك" : "Become a Partner"}
+              </Text>
+              <Text style={{ color: "#64748B", fontSize: 12, marginTop: 4, textAlign: isRTL ? "right" : "left" }}>
+                {isRTL ? "سجّل وكالتك أو شركتك وابدأ التعاون معنا" : "Register your agency or company to work with us"}
+              </Text>
+            </View>
+            <IconSymbol name="chevron.right" size={18} color="#1E3A8A" />
+          </Pressable>
+        </View>
+
+        {/* Popular Activities */}
+        <View style={[styles.section, { marginBottom: 24 }]}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: "#FFFFFF" }]}>
+              {isRTL ? "أنشطة شعبية" : "Popular Activities"}
+            </Text>
+            <Pressable onPress={() => router.push("/activities" as any)}>
+              <Text style={[styles.seeAll, { color: "#D4AF37" }]}>{t.seeAll}</Text>
+            </Pressable>
+          </View>
+          <FlatList
+            horizontal
+            scrollEnabled
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 12 }}
+            keyExtractor={(item) => item.id}
+            data={[
+              { id: "a1", city: "Barcelona", code: "BCN", emoji: "🇪🇸", activity: isRTL ? "جولة معمارية" : "Architecture Tour", color: "#F59E0B", image: "https://images.unsplash.com/photo-1539037116277-4db20889f2d4?w=400&q=80" },
+              { id: "a2", city: "Dubai", code: "DXB", emoji: "🇦🇪", activity: isRTL ? "رحلة صحراء" : "Desert Safari", color: "#EF4444", image: "https://images.unsplash.com/photo-1512453979798-5ea266f8880c?w=400&q=80" },
+              { id: "a3", city: "Paris", code: "PAR", emoji: "🇫🇷", activity: isRTL ? "جولة برج إيفل" : "Eiffel Tower Tour", color: "#6366F1", image: "https://images.unsplash.com/photo-1502602898657-3e91760cbb34?w=400&q=80" },
+              { id: "a4", city: "Palma", code: "PMI", emoji: "🇪🇸", activity: isRTL ? "غطس ومغامرة" : "Snorkeling & Diving", color: "#10B981", image: "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=400&q=80" },
+            ]}
+            renderItem={({ item }) => (
+              <Pressable
+                style={({ pressed }) => [{
+                  width: 160,
+                  borderRadius: 16,
+                  overflow: "hidden",
+                  opacity: pressed ? 0.9 : 1,
+                }]}
+                onPress={() => {
+                  setActiveTab("activities");
+                  setActivityDest(item.city);
+                  setActivityDestCode(item.code);
+                }}
+              >
+                <Image source={{ uri: item.image }} style={{ width: 160, height: 110 }} />
+                <View style={[{ backgroundColor: item.color + "18", padding: 10, borderWidth: 1, borderColor: item.color + "30", borderTopWidth: 0 }]}>
+                  <Text style={{ fontSize: 11, color: item.color, fontWeight: "700", marginBottom: 2 }}>{item.emoji} {item.city}</Text>
+                  <Text style={{ fontSize: 13, fontWeight: "700", color: colors.foreground }}>{item.activity}</Text>
+                </View>
+              </Pressable>
+            )}
+          />
+        </View>
+
+        {/* eSIM Go Featured Plans */}
+        <View style={[styles.section, { marginBottom: 24 }]}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: "#FFFFFF" }]}>
+              {isRTL ? "خطط eSIM مميزة" : "Featured eSIM Plans"}
+            </Text>
+            <Pressable onPress={() => router.push("/(tabs)/esim" as any)}>
+              <Text style={[styles.seeAll, { color: "#D4AF37" }]}>{t.seeAll}</Text>
+            </Pressable>
+          </View>
+          {/* Featured eSIM plans removed - no fake prices */}
+          <View style={{ paddingHorizontal: 20, paddingVertical: 16, backgroundColor: colors.surface, borderRadius: 12, marginHorizontal: 20 }}>
+            <Text style={{ fontSize: 14, color: colors.muted, textAlign: isRTL ? 'right' : 'left' }}>
+              {isRTL ? 'لا توجد خطط eSIM متاحة حاليًا، يرجى المحاولة لاحقًا أو التواصل معنا.' : 'No eSIM plans available right now. Please try again later or contact us.'}
+            </Text>
+          </View>
+        </View>
+
+        {/* Customer Reviews */}
+        <View style={[styles.section, { marginBottom: 24 }]}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: "#FFFFFF" }]}>
+              {isRTL ? "تقييمات العملاء" : "Customer Reviews"}
+            </Text>
+            <Pressable>
+              <Text style={[styles.seeAll, { color: "#D4AF37" }]}>{t.seeAll}</Text>
+            </Pressable>
+          </View>
+          <FlatList
+            horizontal
+            scrollEnabled
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 12 }}
+            keyExtractor={(item) => item.id}
+            data={[
+              {
+                id: "r1",
+                name: isRTL ? "أحمد محمد" : "Ahmed Mohamed",
+                rating: 5,
+                comment: isRTL ? "خدمة ممتازة وأسعار رائعة! حجزت رحلتي بسهولة وسرعة." : "Excellent service and great prices! Booked my flight easily.",
+                avatar: "👨‍💼",
+                verified: true,
+              },
+              {
+                id: "r2",
+                name: isRTL ? "فاطمة علي" : "Fatima Ali",
+                rating: 5,
+                comment: isRTL ? "دعم العملاء رائع جداً! ساعدوني في كل خطوة من الحجز." : "Amazing customer support! They helped me every step.",
+                avatar: "👩‍💼",
+                verified: true,
+              },
+              {
+                id: "r3",
+                name: isRTL ? "محمود حسن" : "Mahmoud Hassan",
+                rating: 5,
+                comment: isRTL ? "أفضل تطبيق للحجز! استخدمته عدة مرات وكل مرة تجربة رائعة." : "Best booking app! Used it multiple times, always great.",
+                avatar: "👨‍🔧",
+                verified: true,
+              },
+              {
+                id: "r4",
+                name: isRTL ? "سارة محمود" : "Sarah Mahmoud",
+                rating: 5,
+                comment: isRTL ? "أسعار منافسة جداً وخيارات متنوعة. ممتاز جداً!" : "Competitive prices and great options. Highly recommended!",
+                avatar: "👩‍🎓",
+                verified: true,
+              },
+            ]}
+            renderItem={({ item }) => (
+              <View
+                style={{
+                  width: 280,
+                  backgroundColor: colors.surface,
+                  borderColor: colors.border,
+                  borderWidth: 1,
+                  borderRadius: 14,
+                  padding: 14,
+                  gap: 10,
+                }}
+              >
+                {/* Header with avatar and name */}
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                  <Text style={{ fontSize: 36 }}>{item.avatar}</Text>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text style={{ fontSize: 13, fontWeight: "700", color: colors.foreground }}>{item.name}</Text>
+                      {item.verified && <Text style={{ fontSize: 12, color: "#10B981" }}>✓</Text>}
+                    </View>
+                    {/* Stars */}
+                    <View style={{ flexDirection: "row", gap: 2, marginTop: 2 }}>
+                      {[...Array(item.rating)].map((_, i) => (
+                        <Text key={i} style={{ fontSize: 12, color: "#F59E0B" }}>★</Text>
+                      ))}
+                    </View>
+                  </View>
+                </View>
+                {/* Comment */}
+                <Text style={{ fontSize: 12, color: colors.muted, lineHeight: 18 }}>
+                  "{item.comment}"
+                </Text>
+              </View>
+            )}
+          />
+        </View>
+
+        {/* Why Book With Us */}
+        <View style={[styles.section, { paddingBottom: 32 }]}>
+          <View style={styles.sectionHeader}>
+            <Text style={[styles.sectionTitle, { color: "#FFFFFF" }]}>
+              {isRTL ? "لماذا Royal Voyage؟" : "Why Royal Voyage?"}
+            </Text>
+          </View>
+          {[
+            {
+              icon: "checkmark.seal.fill" as const,
+              color: "#10B981",
+              title: isRTL ? "تذاكر حقيقية" : "Real Tickets",
+              desc: isRTL ? "نحجز مباشرة من شركات الطيران" : "We book directly from airlines",
+            },
+            {
+              icon: "lock.shield.fill" as const,
+              color: "#6366F1",
+              title: isRTL ? "دفع آمن" : "Secure Payment",
+              desc: isRTL ? "دفع ببطاقة أو Bankily أو Sedad" : "Pay by card, Bankily or Sedad",
+            },
+            {
+              icon: "headphones" as const,
+              color: "#F59E0B",
+              title: isRTL ? "دعم 24/7" : "24/7 Support",
+              desc: isRTL ? "فريقنا جاهز لمساعدتك دائما" : "Our team is always here for you",
+            },
+          ].map((item) => (
+            <View
+              key={item.title}
+              style={[styles.dealCard, { backgroundColor: colors.surface, borderColor: colors.border, flexDirection: "row", alignItems: "center", gap: 14 }]}
+            >
+              <View style={[styles.airlineIcon, { backgroundColor: item.color + "18" }]}>
+                <IconSymbol name={item.icon} size={24} color={item.color} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.dealAirline, { color: colors.foreground }]}>{item.title}</Text>
+                <Text style={[styles.dealRoute, { color: colors.muted }]}>{item.desc}</Text>
+              </View>
+            </View>
+          ))}
+        </View>
+
+        {/* Social Media Buttons */}
+        <View style={styles.socialSection}>
+          <View style={styles.socialRow}>
+            <Pressable
+              style={({ pressed }) => [
+                styles.socialBtn,
+                { backgroundColor: "#25D366", opacity: pressed ? 0.8 : 1 },
+              ]}
+              onPress={() => Linking.openURL("https://wa.me/22233700000")}
+            >
+              <FontAwesome5 name="whatsapp" size={22} color="#fff" />
+              <Text style={styles.socialBtnText}>WhatsApp</Text>
+            </Pressable>
+
+            <Pressable
+              style={({ pressed }) => [
+                styles.socialBtn,
+                { backgroundColor: "#1877F2", opacity: pressed ? 0.8 : 1 },
+              ]}
+              onPress={() => Linking.openURL("https://www.facebook.com/royalvoyage.mr")}
+            >
+              <FontAwesome5 name="facebook" size={22} color="#fff" />
+              <Text style={styles.socialBtnText}>Facebook</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        {/* ===== LEGAL FOOTER ===== */}
+        <View style={styles.legalFooter}>
+          <Text style={[styles.legalFooterTitle, { color: colors.muted }]}>
+            Royal Voyage © 2023
+          </Text>
+          <View style={styles.legalLinksRow}>
+            <Pressable onPress={() => router.push("/about" as any)}>
+              <Text style={[styles.legalLink, { color: colors.primary }]}>
+                {language === "ar" ? "من نحن" : language === "fr" ? "À propos" : "About Us"}
+              </Text>
+            </Pressable>
+            <Text style={{ color: colors.muted }}> · </Text>
+            <Pressable onPress={() => router.push("/privacy" as any)}>
+              <Text style={[styles.legalLink, { color: colors.primary }]}>
+                {language === "ar" ? "الخصوصية" : language === "fr" ? "Confidentialité" : "Privacy"}
+              </Text>
+            </Pressable>
+            <Text style={{ color: colors.muted }}> · </Text>
+            <Pressable onPress={() => router.push("/terms" as any)}>
+              <Text style={[styles.legalLink, { color: colors.primary }]}>
+                {language === "ar" ? "الشروط" : language === "fr" ? "CGU" : "Terms"}
+              </Text>
+            </Pressable>
+            <Text style={{ color: colors.muted }}> · </Text>
+            <Pressable onPress={() => router.push("/refund" as any)}>
+              <Text style={[styles.legalLink, { color: colors.primary }]}>
+                {language === "ar" ? "الإلغاء" : language === "fr" ? "Annulation" : "Cancellation"}
+              </Text>
+            </Pressable>
+            <Text style={{ color: colors.muted }}> · </Text>
+            <Pressable onPress={() => router.push("/contact" as any)}>
+              <Text style={[styles.legalLink, { color: colors.primary }]}>
+                {language === "ar" ? "تواصل" : language === "fr" ? "Contact" : "Contact"}
+              </Text>
+            </Pressable>
+          </View>
+          <Text style={[styles.legalFooterSub, { color: colors.muted }]}>
+            {language === "ar"
+              ? "وكالة سفر موثوقة • تفرغ زين، نواكشوط، موريتانيا"
+              : language === "fr"
+              ? "Agence de voyage agréée • Tavragh Zeina, Nouakchott, Mauritanie"
+              : "Licensed Travel Agency • Tavragh Zeina, Nouakchott, Mauritania"}
+          </Text>
+        </View>
+
+      </ScrollView>
+
+      {/* Voice Search Modal */}
+      {voiceModalVisible && (
+        <VoiceSearchModal
+          visible={voiceModalVisible}
+          onClose={() => setVoiceModalVisible(false)}
+          onResult={handleVoiceResult}
+          isRTL={isRTL}
+        />
+      )}
+    </ScreenContainer>
+  );
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+
+const styles = StyleSheet.create({
+  header: {
+    paddingHorizontal: 16,
+    paddingTop: 6,
+    paddingBottom: 36,
+  },
+  headerTop: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+  greeting: {
+    color: "rgba(255,255,255,0.75)",
+    fontSize: 14,
+  },
+  userName: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  notifButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 12,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  headerSubtitle: {
+    color: "rgba(255,255,255,0.65)",
+    fontSize: 14,
+  },
+  searchWidget: {
+    marginHorizontal: 12,
+    marginTop: -26,
+    borderRadius: 18,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.10,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  tabRow: {
+    paddingVertical: 6,
+  },
+  tabScrollContent: {
+    paddingHorizontal: 6,
+    gap: 6,
+  },
+  tabButton: {
+    minWidth: 104,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    gap: 6,
+    backgroundColor: "#FFFFFF",
+    borderColor: "#D4AF37",
+    borderWidth: 1,
+  },
+  tabLabel: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  searchForm: {
+    padding: 12,
+    gap: 8,
+  },
+  // ── Trip Type Toggle ──
+  tripTypeRow: {
+    flexDirection: "row",
+    borderRadius: 12,
+    borderWidth: 1,
+    overflow: "hidden",
+    padding: 3,
+    gap: 3,
+  },
+  tripTypeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 8,
+    borderRadius: 10,
+    gap: 5,
+  },
+  tripTypeText: {
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  // ── Field with voice button ──
+  fieldWithVoice: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  voiceBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    flexShrink: 0,
+  },
+  // ── Swap button ──
+  swapRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginVertical: -4,
+  },
+  swapDivider: {
+    flex: 1,
+    height: 1,
+  },
+  swapBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 3,
+    marginHorizontal: 8,
+  },
+  // ── Date arrow ──
+  dateArrow: {
+    paddingHorizontal: 4,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  // ── Trip badge ──
+  tripBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  tripBadgeText: {
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  rowFields: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  datesColumn: {
+    borderRadius: 12,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  dateSeparator: {
+    height: 1,
+    marginHorizontal: 12,
+  },
+  passengersCard: {
+    borderRadius: 12,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  counterItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  counterItemLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    flex: 1,
+  },
+  counterItemLabel: {
+    fontSize: 14,
+    fontWeight: "500",
+  },
+  counterBtns: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+  },
+  counterCircle: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    borderWidth: 1.5,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  counterCircleText: {
+    fontSize: 20,
+    fontWeight: "700",
+    lineHeight: 24,
+  },
+  counterNum: {
+    fontSize: 17,
+    fontWeight: "700",
+    minWidth: 28,
+    textAlign: "center",
+  },
+  counterDivider: {
+    height: 1,
+    marginHorizontal: 14,
+  },
+  flexibleToggle: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+  },
+  flexibleCheckbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 2,
+    justifyContent: "center",
+    alignItems: "center",
+    flexShrink: 0,
+  },
+  flexibleTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  flexibleSub: {
+    fontSize: 11,
+    marginTop: 2,
+  },
+  searchField: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  fieldLabel: {
+    fontSize: 11,
+    marginBottom: 2,
+  },
+  fieldValue: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  counterRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
+  searchButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 14,
+    borderRadius: 14,
+    gap: 8,
+    marginTop: 2,
+  },
+  searchButtonText: {
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  section: {
+    marginTop: 20,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    marginBottom: 14,
+  },
+  sectionTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+  },
+  seeAll: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  destCard: {
+    width: 150,
+    height: 185,
+    borderRadius: 14,
+    overflow: "hidden",
+  },
+  destImage: {
+    width: "100%",
+    height: "100%",
+  },
+  destTag: {
+    position: "absolute",
+    top: 10,
+    right: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  destTagText: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#FFFFFF",
+  },
+  destInfo: {
+    position: "absolute",
+    bottom: 12,
+    left: 12,
+    right: 12,
+  },
+  destCity: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "700",
+  },
+  destCountry: {
+    color: "rgba(255,255,255,0.8)",
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  destPrice: {
+    color: "#C9A84C",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  dealCard: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginHorizontal: 20,
+    marginBottom: 12,
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 1,
+  },
+  dealLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    flex: 1,
+  },
+  airlineIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  dealAirline: {
+    fontSize: 15,
+    fontWeight: "600",
+    marginBottom: 2,
+  },
+  dealRoute: {
+    fontSize: 13,
+    marginBottom: 2,
+  },
+  dealDuration: {
+    fontSize: 12,
+  },
+  dealRight: {
+    alignItems: "flex-end",
+    gap: 4,
+  },
+  dealPrice: {
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  dealClass: {
+    fontSize: 12,
+  },
+  dealSeats: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+  },
+  dealSeatsText: {
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  cabinRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 6,
+  },
+  cabinBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 20,
+    borderWidth: 1,
+  },
+  cabinBtnText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  socialSection: {
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    paddingBottom: 32,
+  },
+  socialRow: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  socialBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+    paddingVertical: 14,
+    borderRadius: 14,
+  },
+  socialBtnText: {
+    color: "#fff",
+    fontWeight: "700",
+    fontSize: 15,
+  },
+  legalFooter: {
+    paddingVertical: 24,
+    paddingHorizontal: 20,
+    alignItems: "center" as const,
+    borderTopWidth: 1,
+    borderTopColor: "#E5E7EB",
+    marginTop: 8,
+  },
+  legalFooterTitle: {
+    fontSize: 13,
+    fontWeight: "600" as const,
+    marginBottom: 10,
+  },
+  legalLinksRow: {
+    flexDirection: "row" as const,
+    flexWrap: "wrap" as const,
+    justifyContent: "center" as const,
+    alignItems: "center" as const,
+    marginBottom: 10,
+  },
+  legalLink: {
+    fontSize: 12,
+    fontWeight: "500" as const,
+    paddingVertical: 2,
+    paddingHorizontal: 2,
+  },
+  legalFooterSub: {
+    fontSize: 11,
+    textAlign: "center" as const,
+    lineHeight: 16,
+  },
+  // Multi-city styles
+  multiLegCard: {
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 12,
+    gap: 8,
+  },
+  multiLegHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    marginBottom: 4,
+  },
+  multiLegTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  multiLegRemove: {
+    padding: 4,
+  },
+  addLegBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderStyle: "dashed",
+  },
+  addLegText: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+});
+
+// ── Voice Modal Styles ────────────────────────────────────────────────────────
+
+const voiceStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    justifyContent: "flex-end",
+  },
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.5)",
+  },
+  sheet: {
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: 24,
+    paddingBottom: 40,
+    paddingTop: 12,
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    elevation: 20,
+  },
+  handle: {
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    marginBottom: 20,
+  },
+  title: {
+    fontSize: 20,
+    fontWeight: "700",
+    marginBottom: 6,
+  },
+  subtitle: {
+    fontSize: 14,
+    textAlign: "center",
+    marginBottom: 28,
+  },
+  waveContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    height: 60,
+    marginBottom: 28,
+  },
+  wavebar: {
+    width: 5,
+    height: 48,
+    borderRadius: 3,
+  },
+  micButton: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 24,
+  },
+  resultBox: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 16,
+    maxWidth: "100%",
+  },
+  resultText: {
+    fontSize: 15,
+    fontWeight: "600",
+    flex: 1,
+  },
+
+  manualBox: {
+    width: "100%",
+    gap: 10,
+    marginBottom: 14,
+  },
+  manualInput: {
+    width: "100%",
+    borderWidth: 1,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
+  },
+  useTextBtn: {
+    width: "100%",
+    borderRadius: 14,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  useTextBtnText: {
+    color: "#FFFFFF",
+    fontWeight: "800",
+    fontSize: 15,
+  },
+  cancelBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 24,
+  },
+  cancelText: {
+    fontSize: 15,
+  },
+});

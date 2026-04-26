@@ -1,0 +1,50 @@
+name: Royal Voyage EAS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'EAS profile to build'
+        required: true
+        default: 'public-preview'
+        type: choice
+        options:
+          - public-preview
+          - public-production
+          - admin-internal
+          - admin-preview
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: TypeScript check
+        run: pnpm check
+
+      - name: Expo Doctor
+        run: npx expo-doctor
+
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Build with EAS
+        run: eas build --platform android --profile ${{ github.event.inputs.profile }} --non-interactive
